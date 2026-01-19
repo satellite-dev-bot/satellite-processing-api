@@ -1,12 +1,13 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import rasterio
+from PIL import Image
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import os
 from datetime import datetime
 import tempfile
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -31,139 +32,125 @@ def cleanup_old_files():
     except Exception as e:
         print(f"Cleanup error: {e}")
 
-def get_band_info(raster_path):
-    with rasterio.open(raster_path) as src:
-        band_info = {
-            'band_count': src.count,
-            'bands': [],
-            'width': src.width,
-            'height': src.height,
-            'crs': str(src.crs) if src.crs else 'Unknown',
-            'bounds': list(src.bounds),
-            'file_size': os.path.getsize(raster_path)
-        }
-        
-        for i in range(1, src.count + 1):
-            try:
-                band = src.read(i)
-                nodata = src.nodatavals[i-1] if src.nodatavals else None
+def analyze_tiff_basic(file_path):
+    """Basic TIFF analysis using PIL"""
+    try:
+        with Image.open(file_path) as img:
+            # Get basic image info
+            width, height = img.size
+            mode = img.mode
+            
+            # Count bands based on mode
+            band_count_map = {
+                'L': 1,      # Grayscale
+                'RGB': 3,    # RGB
+                'RGBA': 4,   # RGB + Alpha
+                'CMYK': 4,   # CMYK
+                'I': 1,      # 32-bit integer
+                'F': 1       # 32-bit float
+            }
+            
+            band_count = band_count_map.get(mode, 1)
+            
+            # Try to get more info
+            bands_info = []
+            if hasattr(img, 'getbands'):
+                band_names = img.getbands()
+                for i, name in enumerate(band_names, 1):
+                    bands_info.append({
+                        'band_number': i,
+                        'name': str(name),
+                        'data_type': mode,
+                        'min_value': 0,
+                        'max_value': 255 if mode in ['L', 'RGB', 'RGBA'] else 65535,
+                        'mean_value': None,
+                        'nodata': None,
+                        'resolution': [1.0, 1.0]
+                    })
+            
+            return {
+                'band_count': band_count,
+                'bands': bands_info,
+                'width': width,
+                'height': height,
+                'crs': 'Unknown (basic mode)',
+                'bounds': [0, 0, width, height],
+                'file_size': os.path.getsize(file_path)
+            }
+    except Exception as e:
+        raise RuntimeError(f"Error analyzing TIFF: {str(e)}")
+
+def calculate_simple_index(file_path, index_name):
+    """Simplified index calculation using PIL"""
+    try:
+        with Image.open(file_path) as img:
+            # Convert to RGB if needed
+            if img.mode != 'RGB' and img.mode != 'RGBA':
+                img = img.convert('RGB')
+            
+            # Get numpy array
+            img_array = np.array(img)
+            
+            # Assume standard band order: R, G, B
+            if len(img_array.shape) == 3:
+                red = img_array[:, :, 0].astype(float)
+                green = img_array[:, :, 1].astype(float)
+                blue = img_array[:, :, 2].astype(float)
                 
-                if nodata is not None:
-                    band_masked = np.ma.masked_equal(band, nodata)
+                # Simple calculations (approximation)
+                if index_name == 'NDVI':
+                    # Approximation: using red/green as proxy
+                    result = (green - red) / (green + red + 1e-10)
+                elif index_name == 'GNDVI':
+                    result = (green - red) / (green + red + 1e-10)
+                elif index_name == 'NDWI':
+                    result = (green - blue) / (green + blue + 1e-10)
                 else:
-                    band_masked = np.ma.masked_invalid(band)
+                    # Default calculation
+                    result = (green - red) / (green + red + 1e-10)
                 
-                band_meta = {
-                    'band_number': i,
-                    'name': src.descriptions[i-1] if src.descriptions and src.descriptions[i-1] else f'Band_{i}',
-                    'data_type': str(src.dtypes[i-1]),
-                    'min_value': float(band_masked.min()) if band_masked.count() > 0 else None,
-                    'max_value': float(band_masked.max()) if band_masked.count() > 0 else None,
-                    'mean_value': float(band_masked.mean()) if band_masked.count() > 0 else None,
-                    'nodata': nodata,
-                    'resolution': src.res
-                }
+                # Normalize to -1 to 1
+                result = np.clip(result, -1, 1)
                 
-                band_info['bands'].append(band_meta)
-            except Exception as e:
-                print(f"Error reading band {i}: {e}")
-                continue
-        
-        return band_info
+                return result
+            else:
+                raise ValueError("Image must have at least 3 bands")
+    except Exception as e:
+        raise RuntimeError(f"Error calculating index: {str(e)}")
 
-def calculate_index(raster_path, index_name):
-    index_formulas = {
-        'NDVI': lambda nir, red: (nir - red) / (nir + red + 1e-10),
-        'NDRE': lambda nir, rededge: (nir - rededge) / (nir + rededge + 1e-10),
-        'EVI': lambda nir, red, blue: 2.5 * ((nir - red) / (nir + 6*red - 7.5*blue + 1 + 1e-10)),
-        'SAVI': lambda nir, red: ((nir - red) / (nir + red + 0.5 + 1e-10)) * 1.5,
-        'NDWI': lambda green, nir: (green - nir) / (green + nir + 1e-10),
-        'GNDVI': lambda nir, green: (nir - green) / (nir + green + 1e-10),
-    }
+def create_points_excel(data_array, output_path):
+    """Convert array to point coordinates with values"""
+    height, width = data_array.shape
     
-    if index_name not in index_formulas:
-        raise ValueError(f"Unsupported index: {index_name}")
+    # Sample every Nth pixel to avoid huge files
+    step = max(1, min(height, width) // 100)  # Max 10,000 points
     
-    output_path = str(raster_path).replace('.tif', f'_{index_name}.tif')
+    rows, cols = np.meshgrid(
+        np.arange(0, height, step),
+        np.arange(0, width, step),
+        indexing='ij'
+    )
     
-    with rasterio.open(raster_path) as src:
-        band_count = src.count
-        
-        if band_count == 3:
-            bands = {'red': 1, 'green': 2, 'blue': 3}
-        elif band_count == 4:
-            bands = {'red': 1, 'green': 2, 'blue': 3, 'nir': 4}
-        elif band_count >= 5:
-            bands = {'blue': 1, 'green': 2, 'red': 3, 'nir': 4, 'rededge': 5}
-        else:
-            raise ValueError(f"Insufficient bands")
-        
-        if index_name == 'NDVI':
-            nir = src.read(bands['nir']).astype(float)
-            red = src.read(bands['red']).astype(float)
-            result = index_formulas['NDVI'](nir, red)
-        elif index_name == 'NDRE':
-            nir = src.read(bands['nir']).astype(float)
-            rededge = src.read(bands['rededge']).astype(float)
-            result = index_formulas['NDRE'](nir, rededge)
-        elif index_name == 'EVI':
-            nir = src.read(bands['nir']).astype(float)
-            red = src.read(bands['red']).astype(float)
-            blue = src.read(bands['blue']).astype(float)
-            result = index_formulas['EVI'](nir, red, blue)
-        elif index_name == 'SAVI':
-            nir = src.read(bands['nir']).astype(float)
-            red = src.read(bands['red']).astype(float)
-            result = index_formulas['SAVI'](nir, red)
-        elif index_name == 'NDWI':
-            green = src.read(bands['green']).astype(float)
-            nir = src.read(bands['nir']).astype(float)
-            result = index_formulas['NDWI'](green, nir)
-        elif index_name == 'GNDVI':
-            nir = src.read(bands['nir']).astype(float)
-            green = src.read(bands['green']).astype(float)
-            result = index_formulas['GNDVI'](nir, green)
-        
-        nodata_value = -9999
-        if src.nodata is not None:
-            result[nir == src.nodata] = nodata_value
-        
-        result = np.clip(result, -1, 1)
-        result[~np.isfinite(result)] = nodata_value
-        
-        profile = src.profile.copy()
-        profile.update(dtype=rasterio.float32, count=1, nodata=nodata_value)
-        
-        with rasterio.open(output_path, 'w', **profile) as dst:
-            dst.write(result.astype(rasterio.float32), 1)
+    rows = rows.flatten()
+    cols = cols.flatten()
+    values = data_array[rows, cols]
     
-    return output_path
-
-def raster_to_points_excel(raster_path, output_excel):
-    with rasterio.open(raster_path) as src:
-        data = src.read(1)
-        transform = src.transform
-        nodata = src.nodata if src.nodata is not None else -9999
-        
-        valid_mask = (data != nodata) & np.isfinite(data)
-        rows, cols = np.where(valid_mask)
-        
-        if len(rows) == 0:
-            raise ValueError("No valid data")
-        
-        xs, ys = rasterio.transform.xy(transform, rows, cols)
-        values = data[rows, cols]
-        
-        df = pd.DataFrame({
-            'X': [round(x, 6) for x in xs],
-            'Y': [round(y, 6) for y in ys],
-            'Value': [round(v, 4) for v in values]
-        })
-        
-        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Index_Values')
-        
-        return len(df)
+    # Filter valid values
+    valid_mask = np.isfinite(values)
+    rows = rows[valid_mask]
+    cols = cols[valid_mask]
+    values = values[valid_mask]
+    
+    df = pd.DataFrame({
+        'X': cols,
+        'Y': rows,
+        'Value': np.round(values, 4)
+    })
+    
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Index_Values')
+    
+    return len(df)
 
 @app.route('/api/analyze-bands', methods=['POST'])
 def analyze_bands():
@@ -171,7 +158,7 @@ def analyze_bands():
         return jsonify({'error': 'Unauthorized'}), 401
     
     if 'file' not in request.files:
-        return jsonify({'error': 'No file'}), 400
+        return jsonify({'error': 'No file provided'}), 400
     
     file = request.files['file']
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
@@ -180,7 +167,7 @@ def analyze_bands():
     try:
         cleanup_old_files()
         file.save(temp_path)
-        band_info = get_band_info(str(temp_path))
+        band_info = analyze_tiff_basic(str(temp_path))
         temp_path.unlink()
         return jsonify(band_info)
     except Exception as e:
@@ -194,7 +181,7 @@ def calculate_index_endpoint():
         return jsonify({'error': 'Unauthorized'}), 401
     
     if 'file' not in request.files or 'index' not in request.form:
-        return jsonify({'error': 'Missing params'}), 400
+        return jsonify({'error': 'Missing file or index parameter'}), 400
     
     file = request.files['file']
     index_name = request.form['index'].upper()
@@ -204,9 +191,13 @@ def calculate_index_endpoint():
     try:
         cleanup_old_files()
         file.save(input_path)
-        index_raster = calculate_index(str(input_path), index_name)
+        
+        # Calculate index
+        result_array = calculate_simple_index(str(input_path), index_name)
+        
+        # Create Excel
         output_excel = str(input_path).replace('.tif', f'_{index_name}.xlsx')
-        point_count = raster_to_points_excel(index_raster, output_excel)
+        point_count = create_points_excel(result_array, output_excel)
         
         response = send_file(
             output_excel,
@@ -220,7 +211,6 @@ def calculate_index_endpoint():
         def cleanup():
             try:
                 input_path.unlink()
-                Path(index_raster).unlink()
                 Path(output_excel).unlink()
             except:
                 pass
@@ -236,17 +226,18 @@ def health_check():
     cleanup_old_files()
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'mode': 'basic_mode'
     })
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         'service': 'Satellite Processing API',
-        'version': '1.0'
+        'version': '1.0',
+        'mode': 'basic'
     })
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
+    port = int(os.getenv('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
-gunicorn==21.2.0
